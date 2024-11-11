@@ -7,6 +7,7 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import type { StrategyName } from '../../common/utils/chunking-strategy.factory';
 import { IngestionService } from './ingestion.service';
 import { VectorService } from '../vector/vector.service';
 import { EmbeddingService } from '../embedding/embedding.service';
@@ -21,8 +22,11 @@ export class IngestionController {
 
   @Post('upload')
   @UseInterceptors(FileInterceptor('file'))
-  async uploadFile(@UploadedFile() file: Express.Multer.File) {
-    return await this.ingestionService.processFile(file);
+  async uploadFile(
+    @UploadedFile() file: Express.Multer.File,
+    @Query('strategy') strategy?: StrategyName,
+  ) {
+    return await this.ingestionService.processFile(file, strategy);
   }
 
   @Get('debug')

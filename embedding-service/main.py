@@ -1,5 +1,6 @@
 import base64
 import gc
+import io
 import statistics
 import tempfile
 from typing import List
@@ -36,6 +37,11 @@ class OcrRequest(BaseModel):
     page_index: int  # 0-based page number to OCR
 
 
+class TableExtractRequest(BaseModel):
+    pdf_bytes_b64: str
+    page_index: int  # 0-based page number
+
+
 @app.post("/embed")
 def embed(req: EmbedRequest):
     texts = [INSTRUCTION + t for t in req.texts] if req.is_query else req.texts
@@ -64,7 +70,7 @@ def ocr(req: OcrRequest):
         with tempfile.TemporaryDirectory() as tmp_dir:
             images = pdf2image.convert_from_bytes(
                 raw,
-                dpi=150,
+                dpi=400,
                 first_page=page_1based,
                 last_page=page_1based,
                 output_folder=tmp_dir,
@@ -82,6 +88,7 @@ def ocr(req: OcrRequest):
             raw_bytes_freed = raw  # let go of the raw PDF bytes too
             del raw_bytes_freed
 
+            img_h, img_w = int(img_array.shape[0]), int(img_array.shape[1])
             result = paddle_ocr.ocr(img_array)
             del img_array
             gc.collect()
@@ -91,19 +98,30 @@ def ocr(req: OcrRequest):
         raise HTTPException(status_code=422, detail=f"PDF to image conversion failed: {e}")
 
     words = []
+    ocr_lines = []
+
+    def _bbox_to_rect(poly):
+        xs = [float(p[0]) for p in poly]
+        ys = [float(p[1]) for p in poly]
+        return {"x": min(xs), "y": min(ys), "width": max(xs) - min(xs), "height": max(ys) - min(ys)}
+
     if result:
         for page_result in result:
-            # New PaddleX / PP-OCRv5 format: each element is a dict with
-            # 'rec_texts' and 'rec_scores' lists.
+            # New PaddleX / PP-OCRv5 format: dict with rec_texts, rec_scores, dt_polys
             if isinstance(page_result, dict):
-                rec_texts = page_result.get("rec_texts", [])
+                rec_texts  = page_result.get("rec_texts", [])
                 rec_scores = page_result.get("rec_scores", [])
-                for text, score in zip(rec_texts, rec_scores):
-                    if text.strip():
-                        words.append((text, float(score)))
-            # Old PaddleOCR format: list of [bbox, [text, confidence]] lines.
+                dt_polys   = page_result.get("dt_polys", [])
+                for idx, (text, score) in enumerate(zip(rec_texts, rec_scores)):
+                    if not text.strip():
+                        continue
+                    words.append((text, float(score)))
+                    rect = _bbox_to_rect(dt_polys[idx]) if idx < len(dt_polys) else {"x": 0, "y": 0, "width": 0, "height": 0}
+                    ocr_lines.append({**rect, "text": text, "confidence": float(score)})
+            # Old PaddleOCR format: list of [bbox, [text, confidence]]
             elif isinstance(page_result, list):
                 for word_info in page_result:
+                    bbox = word_info[0] if word_info else None
                     part = word_info[1]
                     if isinstance(part, (list, tuple)) and len(part) >= 2:
                         text, confidence = part[0], part[1]
@@ -113,8 +131,11 @@ def ocr(req: OcrRequest):
                         text, confidence = part, 1.0
                     else:
                         continue
-                    if text.strip():
-                        words.append((text, float(confidence)))
+                    if not text.strip():
+                        continue
+                    words.append((text, float(confidence)))
+                    rect = _bbox_to_rect(bbox) if bbox else {"x": 0, "y": 0, "width": 0, "height": 0}
+                    ocr_lines.append({**rect, "text": text, "confidence": float(confidence)})
 
     text = " ".join(w for w, _ in words)
     confidence = round(statistics.mean(c * 100 for _, c in words), 2) if words else 0.0
@@ -132,9 +153,43 @@ def ocr(req: OcrRequest):
     # text = " ".join(w for w, _ in words)
     # confidence = round(statistics.mean(c for _, c in words), 2) if words else 0.0
 
-    return {"text": text, "confidence": confidence}
+    return {"text": text, "confidence": confidence, "lines": ocr_lines, "image_height": img_h, "image_width": img_w}
+
+
+@app.post("/extract-tables")
+def extract_tables(req: TableExtractRequest):
+    try:
+        import pdfplumber
+        raw = base64.b64decode(req.pdf_bytes_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 input or pdfplumber unavailable")
+
+    try:
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            if req.page_index >= len(pdf.pages):
+                raise HTTPException(status_code=400, detail=f"Page index {req.page_index} out of range")
+            page = pdf.pages[req.page_index]
+            found = page.find_tables()
+            result = []
+            for i, tbl_finder in enumerate(found):
+                tbl_data = tbl_finder.extract()
+                bbox = tbl_finder.bbox  # (x0, top, x1, bottom)
+                rows = [
+                    " | ".join(cell or "" for cell in row)
+                    for row in (tbl_data or [])
+                ]
+                result.append({
+                    "bbox": {"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+                    "text": "\n".join(rows),
+                })
+        return {"tables": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Table extraction failed: {e}")
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "dims": model.get_sentence_embedding_dimension()}
+

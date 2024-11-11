@@ -1,7 +1,10 @@
 /* eslint-disable prettier/prettier */
+import * as fs from 'fs';
+import * as path from 'path';
 import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
 import pdfParse from 'pdf-parse';
-import { chunkText } from '../../common/utils/chunk.util';
+import { PdfTextItem } from '../../common/types/chunking.types';
+import { createChunkingStrategy, StrategyName } from '../../common/utils/chunking-strategy.factory';
 import {
   betterOf,
   computeQualityScore,
@@ -18,18 +21,32 @@ export class IngestionService {
     private vectorService: VectorService,
   ) {}
 
-  async processFile(file: Express.Multer.File) {
+  async processFile(file: Express.Multer.File, strategyOverride?: StrategyName) {
     console.log(`\n${'='.repeat(60)}`);
     console.log(`[Ingestion] Processing file: ${file.originalname} (${(file.size / 1024).toFixed(1)} KB)`);
 
     const thresholds = getThresholds();
 
-    // Stage 1: PDF parse — collect per-page texts via pagerender callback
+    // Stage 1: PDF parse — collect per-page texts AND bounding box items
     const perPageTexts: string[] = [];
+    const perPageItems: PdfTextItem[][] = [];
+
     const parsed = await pdfParse(file.buffer, {
       pagerender: (pageData: any) =>
         pageData.getTextContent().then((content: any) => {
-          const pageText = (content.items as any[]).map((item: any) => item.str).join(' ');
+          const rawItems = content.items as any[];
+          const pdfItems: PdfTextItem[] = rawItems.map((item) => ({
+            str: item.str ?? '',
+            transform: Array.isArray(item.transform) ? item.transform : [1, 0, 0, 12, 0, 0],
+            width: item.width ?? 0,
+            height: item.height ?? 0,
+            fontName: item.fontName,
+            fontSize: Math.abs(
+              (item.transform?.[3] ?? item.transform?.[0] ?? 12) as number,
+            ),
+          }));
+          perPageItems.push(pdfItems);
+          const pageText = pdfItems.map((i) => i.str).join(' ');
           perPageTexts.push(pageText);
           return pageText;
         }),
@@ -59,6 +76,25 @@ export class IngestionService {
           if (ocrResult.confidence > 0) ocrConfidences.push(ocrResult.confidence);
           pagesOcrd++;
           console.log(`  Page ${i + 1}: OCR done (conf=${ocrResult.confidence.toFixed(1)}%) — kept ${chosen === ocrResult.text ? 'OCR' : 'pdf-parse'} text`);
+
+          // Patch perPageItems with synthetic PdfTextItems built from OCR bounding boxes.
+          // OCR coords: Y=0 is top, increases downward.
+          // Layout chunker expects PDF coords: Y=0 is bottom, increases upward.
+          // Flip: pdfY = imageHeight - (ocrY + lineHeight)
+          if (ocrResult.lines.length > 0 && ocrResult.imageHeight > 0) {
+            perPageItems[i] = ocrResult.lines.map((line) => {
+              const pdfY = ocrResult.imageHeight - (line.y + line.height);
+              const fontSize = Math.max(line.height, 1);
+              return {
+                str: line.text,
+                transform: [fontSize, 0, 0, fontSize, line.x, pdfY],
+                width: line.width,
+                height: line.height,
+                fontSize,
+              };
+            });
+            console.log(`  Page ${i + 1}: injected ${perPageItems[i].length} synthetic layout items from OCR`);
+          }
         } catch (err) {
           console.warn(`  Page ${i + 1}: OCR failed (${(err as Error).message}) — falling back to pdf-parse text`);
           mergedPages.push(pageText);
@@ -119,23 +155,48 @@ export class IngestionService {
       console.warn(`  *** WARNING: Bad Doc (score=${quality.combinedScore}) — processing with lowConfidence flag ***`);
     }
 
-    // Stage 2: Chunking
-    const chunks = chunkText(finalText);
-    console.log(`\n[Ingestion] Stage 2 — Text chunked`);
-    console.log(`  Total chunks: ${chunks.length}`);
-    chunks.forEach((c, i) => console.log(`  chunk[${i}]: ${c.length} chars`));
+    // Stage 2: Chunking — strategy selected via env var or per-request override
+    const strategy = createChunkingStrategy(strategyOverride);
+    console.log(`\n[Ingestion] Stage 2 — Chunking (strategy: ${strategy.name})`);
+
+    const chunkedDocs = strategy.chunk({
+      fullText: finalText,
+      pageItems: perPageItems.length > 0 ? perPageItems : undefined,
+      pageCount: parsed.numpages,
+      sourceFile: file.originalname,
+    });
+
+    console.log(`  Total chunks: ${chunkedDocs.length}`);
+    const typeCounts = { text: 0, table: 0, figure: 0 };
+    chunkedDocs.forEach((c, i) => {
+      typeCounts[c.type]++;
+      console.log(`  chunk[${i}]: ${c.text.length} chars | type=${c.type} | page=${c.pageNumber}`);
+    });
+    console.log(`  Content types — text: ${typeCounts.text}, table: ${typeCounts.table}, figure: ${typeCounts.figure}`);
+
+    // Debug: dump all chunks to a text file for inspection
+    const debugDir = path.join(process.cwd(), 'chunk-debug');
+    fs.mkdirSync(debugDir, { recursive: true });
+    const safeName = file.originalname.replace(/[^a-z0-9_.-]/gi, '_');
+    const debugPath = path.join(debugDir, `${safeName}_chunks.txt`);
+    const sep = '--------------------------------------------';
+    const chunkLines = chunkedDocs.map((c, i) =>
+      `[Chunk ${i}] type=${c.type} | page=${c.pageNumber} | chars=${c.text.length}\n\n${c.text}\n\n${sep}\n`,
+    );
+    fs.writeFileSync(debugPath, chunkLines.join('\n'), 'utf8');
+    console.log(`  Chunk debug written → ${debugPath}`);
 
     // Stage 3: Embeddings
-    console.log(`\n[Ingestion] Stage 3 — Generating embeddings (${chunks.length} chunks, sequential)`);
+    console.log(`\n[Ingestion] Stage 3 — Generating embeddings (${chunkedDocs.length} chunks, sequential)`);
     const embeddings: number[][] = [];
-    for (const chunk of chunks) {
-      embeddings.push(await this.embeddingService.getEmbedding(chunk));
+    for (const doc of chunkedDocs) {
+      embeddings.push(await this.embeddingService.getEmbedding(doc.text));
     }
     console.log(`[Ingestion] All embeddings done. Each vector: ${embeddings[0]?.length ?? 0} dimensions`);
 
     // Stage 4: Store
     console.log(`\n[Ingestion] Stage 4 — Storing in vector store`);
-    this.vectorService.store(chunks, embeddings);
+    this.vectorService.store(chunkedDocs, embeddings);
 
     console.log(`\n[Ingestion] Done! File: ${file.originalname}`);
     console.log(`${'='.repeat(60)}\n`);
@@ -147,8 +208,10 @@ export class IngestionService {
         pages: parsed.numpages,
         characters: finalText.length,
         words: finalText.trim().split(/\s+/).length,
-        chunks: chunks.length,
+        chunks: chunkedDocs.length,
         embeddingDimensions: embeddings[0]?.length ?? 0,
+        strategy: strategy.name,
+        contentTypes: typeCounts,
       },
       quality: {
         label: quality.label,

@@ -34,4 +34,20 @@ export class EmbeddingService implements OnModuleInit {
     const body = (await res.json()) as { embeddings: number[][] };
     return body.embeddings[0];
   }
+
+  async getOcrPage(pdfBuffer: Buffer, pageIndex: number): Promise<{ text: string; confidence: number }> {
+    const res = await fetch(`${PYTHON_SERVICE_URL}/ocr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pdf_bytes_b64: pdfBuffer.toString('base64'),
+        page_index: pageIndex,
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`OCR service error ${res.status}: ${await res.text()}`);
+    }
+    const body = (await res.json()) as { text: string; confidence: number };
+    return body;
+  }
 }

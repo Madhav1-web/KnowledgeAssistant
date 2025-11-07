@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+sentence-transformers
+torch
+Pillow>=10.0.0
+pdf2image>=1.17.0
+pytesseract>=0.3.10

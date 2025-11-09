@@ -1,30 +1,71 @@
-import { Injectable } from '@nestjs/common';
+/* eslint-disable prettier/prettier */
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
+
+const INDEX_PATH = path.resolve('./data/vectors.faiss');
+const DOCS_PATH = path.resolve('./data/documents.json');
+const DIMS = 1024; // Qwen3-Embedding-0.6B output dimensions (via sentence-transformers)
 
 @Injectable()
-export class VectorService {
+export class VectorService implements OnModuleInit {
+  private readonly logger = new Logger(VectorService.name);
+  private index: any; // faiss-node IndexFlatIP
   private documents: string[] = [];
-  private embeddings: number[][] = [];
 
-  store(chunks: string[], vectors: number[][]) {
+  async onModuleInit() {
+    const faissModule = await import('faiss-node'); // native addon — dynamic import for safety
+    const faiss = (faissModule as any).default ?? faissModule;
+    fs.mkdirSync('./data', { recursive: true });
+
+    if (fs.existsSync(INDEX_PATH) && fs.existsSync(DOCS_PATH)) {
+      this.index = faiss.IndexFlatIP.read(INDEX_PATH);
+      this.documents = JSON.parse(fs.readFileSync(DOCS_PATH, 'utf-8'));
+      this.logger.log(`Loaded ${this.documents.length} vectors from disk.`);
+    } else {
+      this.index = new faiss.IndexFlatIP(DIMS);
+      this.logger.log('Created new FAISS IndexFlatIP (768 dims).');
+    }
+  }
+
+  store(chunks: string[], embeddings: number[][]): void {
+    this.index.add(embeddings.flat()); // faiss-node takes flat numeric array
     this.documents.push(...chunks);
-    this.embeddings.push(...vectors);
+    this.persist();
+    this.logger.log(`Stored ${chunks.length} chunks. Total: ${this.documents.length}`);
   }
 
   search(queryEmbedding: number[], k = 3): string[] {
-    const scores = this.embeddings.map((emb, index) => ({
-      index,
-      score: cosineSimilarity(queryEmbedding, emb),
-    }));
-
-    scores.sort((a, b) => b.score - a.score);
-
-    return scores.slice(0, k).map((s) => this.documents[s.index]);
+    return this.searchWithScores(queryEmbedding, k).map(r => r.chunk);
   }
-}
 
-function cosineSimilarity(a: number[], b: number[]) {
-  const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
-  const magA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
-  const magB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
-  return dot / (magA * magB);
+  searchWithScores(queryEmbedding: number[], k = 3): { chunk: string; score: number }[] {
+    if (this.documents.length === 0) return [];
+    const { labels, distances } = this.index.search(
+      queryEmbedding,
+      Math.min(k, this.documents.length),
+    );
+    return labels.map((idx: number, i: number) => ({
+      chunk: this.documents[idx],
+      score: distances[i],
+    }));
+  }
+
+  private persist(): void {
+    this.index.write(INDEX_PATH);
+    fs.writeFileSync(DOCS_PATH, JSON.stringify(this.documents));
+  }
+
+  getState() {
+    return {
+      totalDocs: this.documents.length,
+      embeddingDimensions: DIMS,
+      indexSize: this.index.ntotal(),
+      docs: this.documents.map((doc, i) => ({
+        index: i,
+        preview: doc.slice(0, 120).replace(/\n/g, ' '),
+        charCount: doc.length,
+      })),
+    };
+  }
 }

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Knowledge Assistant — Test UI</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background: #0f0f0f; color: #e0e0e0; padding: 24px; }
+    h1 { color: #7dd3fc; margin-bottom: 24px; font-size: 18px; }
+    .section { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    .section h2 { color: #a78bfa; font-size: 13px; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 14px; }
+    input[type="file"], input[type="text"] { background: #111; border: 1px solid #444; color: #e0e0e0; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 13px; }
+    input[type="text"] { width: 100%; margin-bottom: 10px; }
+    button { background: #7dd3fc; color: #0f0f0f; border: none; padding: 8px 18px; border-radius: 4px; font-family: monospace; font-weight: bold; cursor: pointer; font-size: 13px; margin-left: 10px; }
+    button:hover { background: #38bdf8; }
+    button.secondary { background: #a78bfa; }
+    button.secondary:hover { background: #818cf8; }
+    .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    #output { background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 16px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-x: auto; max-height: 500px; overflow-y: auto; color: #86efac; margin-top: 16px; min-height: 60px; }
+    .status { font-size: 12px; color: #fbbf24; margin-top: 8px; }
+    .label { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <h1>AI Knowledge Assistant — Pipeline Test UI</h1>
+
+  <div class="section">
+    <h2>1. Upload PDF</h2>
+    <p class="label">Select a PDF and click Upload. Watch the terminal for detailed pipeline logs.</p>
+    <div class="row">
+      <input type="file" id="fileInput" accept=".pdf" />
+      <button onclick="upload()">Upload</button>
+    </div>
+    <div class="status" id="uploadStatus"></div>
+  </div>
+
+  <div class="section">
+    <h2>2. Inspect Vector Store</h2>
+    <p class="label">See all documents currently stored in memory with their chunk previews.</p>
+    <button class="secondary" onclick="debug()">Inspect Store</button>
+  </div>
+
+  <div class="section">
+    <h2>3. Search</h2>
+    <p class="label">Type a question — it will be embedded and matched against stored chunks via cosine similarity.</p>
+    <input type="text" id="searchInput" placeholder="e.g. What is the main topic of the document?" />
+    <div class="row">
+      <button onclick="search()">Search</button>
+    </div>
+  </div>
+
+  <div id="output">Results will appear here...</div>
+
+  <script>
+    const out = document.getElementById('output');
+    const log = (data) => { out.textContent = JSON.stringify(data, null, 2); };
+
+    async function upload() {
+      const file = document.getElementById('fileInput').files[0];
+      if (!file) { alert('Select a PDF first'); return; }
+      document.getElementById('uploadStatus').textContent = 'Uploading... (watch terminal for live logs)';
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const res = await fetch('/documents/upload', { method: 'POST', body: form });
+        const data = await res.json();
+        document.getElementById('uploadStatus').textContent = res.ok ? 'Upload complete!' : 'Error!';
+        log(data);
+      } catch (e) {
+        document.getElementById('uploadStatus').textContent = 'Failed: ' + e.message;
+        out.textContent = String(e);
+      }
+    }
+
+    async function debug() {
+      try {
+        const res = await fetch('/documents/debug');
+        log(await res.json());
+      } catch (e) { out.textContent = String(e); }
+    }
+
+    async function search() {
+      const q = document.getElementById('searchInput').value.trim();
+      if (!q) { alert('Enter a search query'); return; }
+      try {
+        const res = await fetch(`/documents/search?q=${encodeURIComponent(q)}`);
+        log(await res.json());
+      } catch (e) { out.textContent = String(e); }
+    }
+
+    document.getElementById('searchInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') search();
+    });
+  </script>
+</body>
+</html>

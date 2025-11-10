@@ -65,5 +65,7 @@ dist
 
 # Python embedding service
 embedding-service/.venv/
+**/__pycache__/
+*.pyc
 
 *.md

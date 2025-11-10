@@ -1,5 +1,7 @@
 import base64
+import gc
 import statistics
+import tempfile
 from typing import List
 import os
 os.environ["FLAGS_use_mkldnn"] = "0"
@@ -18,8 +20,9 @@ INSTRUCTION = "Instruct: Given a question, retrieve relevant passages that answe
 model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", trust_remote_code=True)
 paddle_ocr = PaddleOCR(
     lang="en",
-    use_angle_cls=True,
-    enable_mkldnn=False
+    use_textline_orientation=True,
+    # Use mobile detection model instead of the default server model — much lower RAM usage
+    text_detection_model_name="PP-OCRv5_mobile_det",
 )
 
 
@@ -56,31 +59,62 @@ def ocr(req: OcrRequest):
     page_1based = req.page_index + 1
     try:
         print(f"We in the ocr endpoint, attempting to convert page {page_1based} of PDF to image...")
-        images = pdf2image.convert_from_bytes(
-            raw, dpi=200, first_page=page_1based, last_page=page_1based
-        )
+        # Use a temp dir so Poppler writes the image to disk instead of keeping it in memory,
+        # and reduce DPI from 200→150 to cut the image footprint by ~44%.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            images = pdf2image.convert_from_bytes(
+                raw,
+                dpi=150,
+                first_page=page_1based,
+                last_page=page_1based,
+                output_folder=tmp_dir,
+                fmt="jpeg",
+                jpegopt={"quality": 85},
+            )
+            if not images:
+                return {"text": "", "confidence": 0.0}
+
+            # --- PaddleOCR path ---
+            img_array = np.array(images[0])
+            # Release the PIL image immediately; we only need the numpy array
+            images[0].close()
+            del images
+            raw_bytes_freed = raw  # let go of the raw PDF bytes too
+            del raw_bytes_freed
+
+            result = paddle_ocr.ocr(img_array)
+            del img_array
+            gc.collect()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"PDF to image conversion failed: {e}")
 
-    if not images:
-        return {"text": "", "confidence": 0.0}
-
-    # --- PaddleOCR path ---
-    # --- PaddleOCR path ---
-    img_array = np.array(images[0])
-
-    result = paddle_ocr.ocr(img_array)
-
     words = []
-
-    if result and result[0]:
-        for line in result:
-            if not line:
-                continue
-            for word_info in line:
-                text, confidence = word_info[1]
-                if text.strip():
-                    words.append((text, float(confidence)))
+    if result:
+        for page_result in result:
+            # New PaddleX / PP-OCRv5 format: each element is a dict with
+            # 'rec_texts' and 'rec_scores' lists.
+            if isinstance(page_result, dict):
+                rec_texts = page_result.get("rec_texts", [])
+                rec_scores = page_result.get("rec_scores", [])
+                for text, score in zip(rec_texts, rec_scores):
+                    if text.strip():
+                        words.append((text, float(score)))
+            # Old PaddleOCR format: list of [bbox, [text, confidence]] lines.
+            elif isinstance(page_result, list):
+                for word_info in page_result:
+                    part = word_info[1]
+                    if isinstance(part, (list, tuple)) and len(part) >= 2:
+                        text, confidence = part[0], part[1]
+                    elif isinstance(part, (list, tuple)) and len(part) == 1:
+                        text, confidence = part[0], 1.0
+                    elif isinstance(part, str):
+                        text, confidence = part, 1.0
+                    else:
+                        continue
+                    if text.strip():
+                        words.append((text, float(confidence)))
 
     text = " ".join(w for w, _ in words)
     confidence = round(statistics.mean(c * 100 for _, c in words), 2) if words else 0.0

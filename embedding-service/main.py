@@ -13,13 +13,14 @@ import pdf2image
 from paddleocr import PaddleOCR
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 app = FastAPI()
 
 INSTRUCTION = "Instruct: Given a question, retrieve relevant passages that answer it\nQuery: "
 
 model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", trust_remote_code=True)
+reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
 paddle_ocr = PaddleOCR(
     lang="en",
     use_textline_orientation=True,
@@ -36,6 +37,11 @@ class EmbedRequest(BaseModel):
 class OcrRequest(BaseModel):
     pdf_bytes_b64: str
     page_index: int  # 0-based page number to OCR
+
+
+class RerankRequest(BaseModel):
+    query: str
+    passages: List[str]
 
 
 class TableExtractRequest(BaseModel):
@@ -73,6 +79,13 @@ def embed(req: EmbedRequest):
         batch_size=8,
     )
     return {"embeddings": embeddings.tolist()}
+
+
+@app.post("/rerank")
+def rerank(req: RerankRequest):
+    pairs = [[req.query, p] for p in req.passages]
+    scores = reranker.predict(pairs)
+    return {"scores": scores.tolist()}
 
 
 @app.post("/ocr")
@@ -215,5 +228,5 @@ def extract_tables(req: TableExtractRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "dims": model.get_sentence_embedding_dimension()}
+    return {"status": "ok", "dims": model.get_sentence_embedding_dimension(), "reranker": "bge-reranker-v2-m3"}
 

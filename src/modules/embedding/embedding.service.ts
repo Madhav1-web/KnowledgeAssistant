@@ -72,6 +72,16 @@ export class EmbeddingService implements OnModuleInit {
     };
   }
 
+  async rerank(query: string, passages: string[]): Promise<number[]> {
+    const res = await fetch(`${PYTHON_SERVICE_URL}/rerank`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, passages }),
+    });
+    const body = (await res.json()) as { scores: number[] };
+    return body.scores;
+  }
+
   async extractTables(
     pdfBuffer: Buffer,
     pageIndex: number,

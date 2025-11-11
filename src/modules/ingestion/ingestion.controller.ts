@@ -39,7 +39,15 @@ export class IngestionController {
     if (!query) return { error: 'Provide a query param: ?q=your+question' };
     console.log(`\n[Search] Query: "${query}"`);
     const queryEmbedding = await this.embeddingService.getEmbedding(query, true);
-    const results = this.vectorService.searchWithScores(queryEmbedding, 3);
+    const candidates = this.vectorService.searchWithScores(queryEmbedding, 20);
+    const rerankScores = await this.embeddingService.rerank(
+      query,
+      candidates.map((r) => r.chunk.text),
+    );
+    const results = candidates
+      .map((r, i) => ({ ...r, rerankScore: rerankScores[i] }))
+      .sort((a, b) => b.rerankScore - a.rerankScore)
+      .slice(0, 3);
     return { query, results };
   }
 }

@@ -6,6 +6,7 @@ import tempfile
 from typing import List
 import os
 os.environ["FLAGS_use_mkldnn"] = "0"
+import cv2
 import numpy as np
 import pdf2image
 # import pytesseract  # Tesseract path (commented — kept for low-confidence fallback)
@@ -40,6 +41,27 @@ class OcrRequest(BaseModel):
 class TableExtractRequest(BaseModel):
     pdf_bytes_b64: str
     page_index: int  # 0-based page number
+
+
+def deskew(img_array: np.ndarray) -> tuple[np.ndarray, float]:
+    """Detect and correct document skew. Returns (corrected_array, angle_degrees)."""
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    coords = np.column_stack(np.where(thresh > 0))
+    if len(coords) == 0:
+        return img_array, 0.0
+    angle = cv2.minAreaRect(coords)[-1]
+    # minAreaRect returns angles in [-90, 0); remap to [-45, 45]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+    if abs(angle) < 0.5:
+        return img_array, angle
+    h, w = img_array.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    rotated = cv2.warpAffine(img_array, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated, angle
 
 
 @app.post("/embed")
@@ -88,6 +110,8 @@ def ocr(req: OcrRequest):
             raw_bytes_freed = raw  # let go of the raw PDF bytes too
             del raw_bytes_freed
 
+            img_array, skew_angle = deskew(img_array)
+            print(f"  [deskew] corrected angle: {skew_angle:.2f}°")
             img_h, img_w = int(img_array.shape[0]), int(img_array.shape[1])
             result = paddle_ocr.ocr(img_array)
             del img_array
@@ -153,7 +177,7 @@ def ocr(req: OcrRequest):
     # text = " ".join(w for w, _ in words)
     # confidence = round(statistics.mean(c for _, c in words), 2) if words else 0.0
 
-    return {"text": text, "confidence": confidence, "lines": ocr_lines, "image_height": img_h, "image_width": img_w}
+    return {"text": text, "confidence": confidence, "lines": ocr_lines, "image_height": img_h, "image_width": img_w, "skew_angle": round(float(skew_angle), 2)}
 
 
 @app.post("/extract-tables")

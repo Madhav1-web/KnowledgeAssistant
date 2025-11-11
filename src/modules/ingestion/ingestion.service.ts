@@ -64,6 +64,9 @@ export class IngestionService {
     const ocrConfidences: number[] = [];
     let pagesOcrd = 0;
 
+    type OcrPageResult = { text: string; confidence: number; lines: { text: string; x: number; y: number; width: number; height: number; confidence: number }[]; imageHeight: number; imageWidth: number; skewAngle: number };
+    const ocrResultsPerPage: (OcrPageResult | null)[] = new Array(perPageTexts.length).fill(null);
+
     for (let i = 0; i < perPageTexts.length; i++) {
       const pageText = perPageTexts[i] ?? '';
 
@@ -71,6 +74,7 @@ export class IngestionService {
         console.log(`  Page ${i + 1}: sparse/garbled (${pageText.length} chars) — triggering OCR`);
         try {
           const ocrResult = await this.embeddingService.getOcrPage(file.buffer, i);
+          ocrResultsPerPage[i] = ocrResult;
           const chosen = betterOf(pageText, ocrResult.text);
           mergedPages.push(chosen);
           if (ocrResult.confidence > 0) ocrConfidences.push(ocrResult.confidence);
@@ -174,17 +178,86 @@ export class IngestionService {
     });
     console.log(`  Content types — text: ${typeCounts.text}, table: ${typeCounts.table}, figure: ${typeCounts.figure}`);
 
-    // Debug: dump all chunks to a text file for inspection
+    // Debug: comprehensive dump of every processing stage
     const debugDir = path.join(process.cwd(), 'chunk-debug');
     fs.mkdirSync(debugDir, { recursive: true });
     const safeName = file.originalname.replace(/[^a-z0-9_.-]/gi, '_');
-    const debugPath = path.join(debugDir, `${safeName}_chunks.txt`);
-    const sep = '--------------------------------------------';
-    const chunkLines = chunkedDocs.map((c, i) =>
-      `[Chunk ${i}] type=${c.type} | page=${c.pageNumber} | chars=${c.text.length}\n\n${c.text}\n\n${sep}\n`,
-    );
-    fs.writeFileSync(debugPath, chunkLines.join('\n'), 'utf8');
-    console.log(`  Chunk debug written → ${debugPath}`);
+    const debugPath = path.join(debugDir, `${safeName}_debug.txt`);
+    const DIV  = '━'.repeat(80);
+    const DIV2 = '─'.repeat(60);
+    const DIV3 = '· · · · · · · · · · · · · · · · · · · · · · · · · ·';
+
+    const lines: string[] = [];
+    const w = (...strs: string[]) => lines.push(...strs);
+
+    // ── FILE INFO ─────────────────────────────────────────────────────────────
+    w(DIV, `FILE: ${file.originalname}`, `SIZE: ${(file.size / 1024).toFixed(1)} KB`, `PAGES: ${parsed.numpages}`, `STRATEGY: ${strategy.name}`, DIV, '');
+
+    // ── PER-PAGE BREAKDOWN ────────────────────────────────────────────────────
+    for (let pg = 0; pg < parsed.numpages; pg++) {
+      w(DIV2, `PAGE ${pg + 1} / ${parsed.numpages}`, DIV2, '');
+
+      // Raw pdf-parse text
+      w('── RAW PDF-PARSE TEXT ──', perPageTexts[pg] ?? '(none)', '', DIV3, '');
+
+      // Raw PdfTextItems
+      const items = perPageItems[pg] ?? [];
+      w(`── RAW ITEMS (${items.length} total) ──`);
+      items.forEach((item, idx) => {
+        const [, , , , x, y] = item.transform;
+        w(`  item[${idx}] x=${x?.toFixed(1)} y=${y?.toFixed(1)} w=${item.width?.toFixed(1)} h=${item.height?.toFixed(1)} fs=${item.fontSize?.toFixed(1)} font="${item.fontName ?? '?'}" str="${item.str}"`);
+      });
+      w('', DIV3, '');
+
+      // OCR result (if this page was OCR'd)
+      const ocr = ocrResultsPerPage[pg];
+      if (ocr) {
+        const skewLabel = Math.abs(ocr.skewAngle) < 0.5
+          ? 'none (<0.5°)'
+          : `${ocr.skewAngle > 0 ? '+' : ''}${ocr.skewAngle.toFixed(2)}° — deskew applied`;
+        w(`── OCR RESULT (conf=${ocr.confidence.toFixed(1)}% | image ${ocr.imageWidth}×${ocr.imageHeight} | skew: ${skewLabel}) ──`);
+        w(`  OCR text: ${ocr.text}`);
+        w('');
+        w(`  OCR lines (${ocr.lines.length}):`);
+        ocr.lines.forEach((ln, idx) => {
+          w(`    line[${idx}] x=${ln.x.toFixed(1)} y=${ln.y.toFixed(1)} w=${ln.width.toFixed(1)} h=${ln.height.toFixed(1)} conf=${ln.confidence.toFixed(3)} → "${ln.text}"`);
+        });
+      } else {
+        w('── OCR: not triggered for this page ──');
+      }
+      w('', DIV3, '');
+
+      // Merged page text (after betterOf decision)
+      w('── MERGED PAGE TEXT (chosen by betterOf) ──', mergedPages[pg] ?? '(none)', '', DIV2, '', '');
+    }
+
+    // ── FINAL COMBINED TEXT ───────────────────────────────────────────────────
+    w(DIV, 'FINAL COMBINED TEXT (all pages joined)', DIV, finalText, '', DIV, '', '');
+
+    // ── CHUNKS ────────────────────────────────────────────────────────────────
+    w(DIV, `CHUNKS — total: ${chunkedDocs.length}  strategy: ${strategy.name}`, DIV, '');
+    chunkedDocs.forEach((c, i) => {
+      const bb = c.boundingBox
+        ? `x=${c.boundingBox.x.toFixed(1)} y=${c.boundingBox.y.toFixed(1)} w=${c.boundingBox.width.toFixed(1)} h=${c.boundingBox.height.toFixed(1)}`
+        : 'no bounding box';
+      const meta = Object.entries(c.metadata).map(([k, v]) => `${k}=${v}`).join(' | ');
+      w(
+        `┌─ CHUNK ${i} ${'─'.repeat(Math.max(0, 70 - String(i).length))}`,
+        `│  type     : ${c.type}`,
+        `│  page     : ${c.pageNumber}`,
+        `│  chars    : ${c.text.length}`,
+        `│  bbox     : ${bb}`,
+        `│  metadata : ${meta}`,
+        `│`,
+        `│  TEXT:`,
+        ...c.text.split('\n').map(l => `│    ${l}`),
+        `└${'─'.repeat(72)}`,
+        '',
+      );
+    });
+
+    fs.writeFileSync(debugPath, lines.join('\n'), 'utf8');
+    console.log(`  Full debug dump written → ${debugPath}`);
 
     // Stage 3: Embeddings
     console.log(`\n[Ingestion] Stage 3 — Generating embeddings (${chunkedDocs.length} chunks, sequential)`);

@@ -41,6 +41,7 @@ export class EmbeddingService implements OnModuleInit {
     lines: { text: string; confidence: number; x: number; y: number; width: number; height: number }[];
     imageHeight: number;
     imageWidth: number;
+    skewAngle: number;
   }> {
     const res = await fetch(`${PYTHON_SERVICE_URL}/ocr`, {
       method: 'POST',
@@ -59,6 +60,7 @@ export class EmbeddingService implements OnModuleInit {
       lines?: { text: string; confidence: number; x: number; y: number; width: number; height: number }[];
       image_height?: number;
       image_width?: number;
+      skew_angle?: number;
     };
     return {
       text: body.text,
@@ -66,6 +68,7 @@ export class EmbeddingService implements OnModuleInit {
       lines: body.lines ?? [],
       imageHeight: body.image_height ?? 0,
       imageWidth: body.image_width ?? 0,
+      skewAngle: body.skew_angle ?? 0,
     };
   }
 

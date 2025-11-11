@@ -11,12 +11,12 @@ import {
 import { FixedChunkStrategy } from './fixed-chunk.strategy';
 
 export interface LayoutChunkOptions {
-  yTolerance?: number;      // max Y diff (PDF units) to be on the same line — default 4
-  gapMultiplier?: number;   // gap > gapMultiplier * avgLineHeight → block boundary — default 1.5
-  maxChunkChars?: number;   // merge text blocks until this limit — default 600
-  columnTolerance?: number; // X gap threshold to detect a new column — default 20
-  minTableRows?: number;    // min distinct Y rows to call a block a table — default 2
-  minTableCols?: number;    // min distinct X columns to call a block a table — default 3
+  yToleranceFactor?: number; // yTolerance = factor × avg font size of page items — default 0.4
+  gapMultiplier?: number;    // gap > gapMultiplier * avgLineHeight → block boundary — default 1.5
+  maxChunkChars?: number;    // merge text blocks until this limit — default 600
+  columnTolerance?: number;  // X gap threshold to detect a new column — default 20
+  minTableRows?: number;     // min distinct Y rows to call a block a table — default 2
+  minTableCols?: number;     // min distinct X columns to call a block a table — default 3
 }
 
 const FIGURE_CAPTION_RE = /^(figure|fig\.|chart|diagram|illustration|image|graph)\s*\d*/i;
@@ -24,7 +24,7 @@ const FIGURE_CAPTION_RE = /^(figure|fig\.|chart|diagram|illustration|image|graph
 export class LayoutChunkStrategy implements ChunkingStrategy {
   readonly name = 'layout' as const;
 
-  private yTolerance: number;
+  private yToleranceFactor: number;
   private gapMultiplier: number;
   private maxChunkChars: number;
   private columnTolerance: number;
@@ -32,7 +32,7 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
   private minTableCols: number;
 
   constructor(options: LayoutChunkOptions = {}) {
-    this.yTolerance = options.yTolerance ?? 4;
+    this.yToleranceFactor = options.yToleranceFactor ?? 0.4;
     this.gapMultiplier = options.gapMultiplier ?? 1.5;
     this.maxChunkChars = options.maxChunkChars ?? 600;
     this.columnTolerance = options.columnTolerance ?? 20;
@@ -90,6 +90,16 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
     });
     if (items.length > 20) console.log(`    ... (${items.length - 20} more items not shown)`);
 
+    // Compute per-page effective yTolerance as a fraction of average font size
+    const fontSizes = items
+      .filter((i) => i.str.trim() && Array.isArray(i.transform) && i.transform.length >= 6)
+      .map((i) => Math.abs(i.transform[3] ?? i.transform[0] ?? 12));
+    const avgFontSize = fontSizes.length > 0
+      ? fontSizes.reduce((a, b) => a + b, 0) / fontSizes.length
+      : 12;
+    const effectiveYTolerance = this.yToleranceFactor * avgFontSize;
+    console.log(`  [groupIntoLines] pg${pageNumber} — avgFontSize=${avgFontSize.toFixed(1)} yToleranceFactor=${this.yToleranceFactor} effectiveYTolerance=${effectiveYTolerance.toFixed(1)}`);
+
     for (const item of items) {
       if (!item.str.trim()) continue;
       if (!Array.isArray(item.transform) || item.transform.length < 6) continue;
@@ -101,7 +111,7 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
       console.log(`  [item] pg${pageNumber} x=${x.toFixed(1)} y=${y.toFixed(1)} fs=${fontSize.toFixed(1)} "${item.str}"`);
 
       // find existing line within Y tolerance
-      const existing = lines.find((l) => Math.abs(l.y - y) <= this.yTolerance);
+      const existing = lines.find((l) => Math.abs(l.y - y) <= effectiveYTolerance);
       if (existing) {
         existing.items.push({ ...item, fontSize });
         // update representative Y as mean
@@ -171,7 +181,7 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
   }
 
   private makeBlock(lines: LayoutLine[], pageNumber: number): LayoutBlock {
-    const text = lines.map((l) => l.text).join('\n');
+    const text = lines.map((l) => l.text).join(' ');
     const minX = Math.min(...lines.map((l) => l.x));
     const maxX = Math.max(...lines.map((l) => l.x + l.width));
     const minY = Math.min(...lines.map((l) => l.y));
@@ -306,7 +316,7 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
         flushAccumulated();
       }
 
-      accText += (accText ? '\n' : '') + block.text;
+      accText += (accText ? ' ' : '') + block.text;
       accBlocks.push(block);
       accAvgFontSize =
         accBlocks.reduce(

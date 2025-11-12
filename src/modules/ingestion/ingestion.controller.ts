@@ -9,8 +9,36 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 import type { StrategyName } from '../../common/utils/chunking-strategy.factory';
 import { IngestionService } from './ingestion.service';
-import { VectorService } from '../vector/vector.service';
+import { VectorService, ScoredResult } from '../vector/vector.service';
 import { EmbeddingService } from '../embedding/embedding.service';
+
+// Reciprocal Rank Fusion — merges semantic and BM25 ranked lists into one ordering.
+// k=60 is the standard constant that dampens the effect of high ranks.
+function reciprocalRankFusion(
+  semanticResults: ScoredResult[],
+  bm25Results: ScoredResult[],
+  k = 60,
+): ScoredResult[] {
+  const scores = new Map<number, { result: ScoredResult; rrfScore: number }>();
+
+  for (let rank = 0; rank < semanticResults.length; rank++) {
+    const r = semanticResults[rank];
+    const entry = scores.get(r.docIndex) ?? { result: r, rrfScore: 0 };
+    entry.rrfScore += 1 / (k + rank + 1);
+    scores.set(r.docIndex, entry);
+  }
+
+  for (let rank = 0; rank < bm25Results.length; rank++) {
+    const r = bm25Results[rank];
+    const entry = scores.get(r.docIndex) ?? { result: r, rrfScore: 0 };
+    entry.rrfScore += 1 / (k + rank + 1);
+    scores.set(r.docIndex, entry);
+  }
+
+  return [...scores.values()]
+    .sort((a, b) => b.rrfScore - a.rrfScore)
+    .map(({ result }) => result);
+}
 
 @Controller('documents')
 export class IngestionController {
@@ -41,27 +69,45 @@ export class IngestionController {
 
     const t0 = performance.now();
 
-    const queryEmbedding = await this.embeddingService.getEmbedding(query, true);
+    const queryEmbedding = await this.embeddingService.getEmbedding(
+      query,
+      true,
+    );
     const tEmbedded = performance.now();
 
-    const candidates = this.vectorService.searchWithScores(queryEmbedding, 20);
-    const tRetrieved = performance.now();
+    // Semantic retrieval (FAISS cosine similarity)
+    const semanticCandidates = this.vectorService.searchWithScores(
+      queryEmbedding,
+      20,
+    );
+    const tFaiss = performance.now();
+
+    // Lexical retrieval (BM25 keyword matching)
+    const bm25Candidates = this.vectorService.searchBm25(query, 20);
+    const tBm25 = performance.now();
+
+    // Merge both lists with Reciprocal Rank Fusion, take top 20 for reranking
+    const merged = reciprocalRankFusion(
+      semanticCandidates,
+      bm25Candidates,
+    ).slice(0, 20);
 
     const rerankScores = await this.embeddingService.rerank(
       query,
-      candidates.map((r) => r.chunk.text),
+      merged.map((r) => r.chunk.text),
     );
     const tReranked = performance.now();
 
-    const results = candidates
+    const results = merged
       .map((r, i) => ({ ...r, rerankScore: rerankScores[i] }))
       .sort((a, b) => b.rerankScore - a.rerankScore)
       .slice(0, 3);
 
     const timings = {
       embedMs: Math.round(tEmbedded - t0),
-      faissMs: Math.round(tRetrieved - tEmbedded),
-      rerankMs: Math.round(tReranked - tRetrieved),
+      faissMs: Math.round(tFaiss - tEmbedded),
+      bm25Ms: Math.round(tBm25 - tFaiss),
+      rerankMs: Math.round(tReranked - tBm25),
       totalMs: Math.round(tReranked - t0),
     };
     console.log(`[Search] timings:`, timings);

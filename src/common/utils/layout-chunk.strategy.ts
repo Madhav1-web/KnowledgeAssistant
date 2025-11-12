@@ -14,6 +14,7 @@ export interface LayoutChunkOptions {
   yToleranceFactor?: number; // yTolerance = factor × avg font size of page items — default 0.4
   gapMultiplier?: number;    // gap > gapMultiplier * avgLineHeight → block boundary — default 1.5
   maxChunkChars?: number;    // merge text blocks until this limit — default 600
+  overlapChars?: number;     // chars of previous chunk to carry into next — default 150
   columnTolerance?: number;  // X gap threshold to detect a new column — default 20
   minTableRows?: number;     // min distinct Y rows to call a block a table — default 2
   minTableCols?: number;     // min distinct X columns to call a block a table — default 3
@@ -27,6 +28,7 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
   private yToleranceFactor: number;
   private gapMultiplier: number;
   private maxChunkChars: number;
+  private overlapChars: number;
   private columnTolerance: number;
   private minTableRows: number;
   private minTableCols: number;
@@ -35,6 +37,7 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
     this.yToleranceFactor = options.yToleranceFactor ?? 0.4;
     this.gapMultiplier = options.gapMultiplier ?? 1.5;
     this.maxChunkChars = options.maxChunkChars ?? 600;
+    this.overlapChars = options.overlapChars ?? 150;
     this.columnTolerance = options.columnTolerance ?? 20;
     this.minTableRows = options.minTableRows ?? 2;
     this.minTableCols = options.minTableCols ?? 3;
@@ -263,18 +266,24 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
     let accText = '';
     let accBlocks: LayoutBlock[] = [];
     let accAvgFontSize = 0;
+    let overlapCarry = ''; // tail of previous text chunk to prepend for context continuity
 
     const flushAccumulated = () => {
       if (!accText.trim()) return;
       const firstBlock = accBlocks[0];
+      const trimmed = accText.trim();
       chunks.push({
-        text: accText.trim(),
+        text: trimmed,
         type: 'text',
         pageNumber: firstBlock?.pageNumber ?? 0,
         chunkIndex: chunkIndex++,
         boundingBox: firstBlock?.boundingBox,
         metadata: { strategy: 'layout', sourceFile },
       });
+      // carry the last overlapChars into the next text chunk to avoid boundary cuts
+      overlapCarry = trimmed.length > this.overlapChars
+        ? trimmed.slice(-this.overlapChars)
+        : '';
       accText = '';
       accBlocks = [];
       accAvgFontSize = 0;
@@ -286,6 +295,7 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
       if (type !== 'text') {
         // non-text blocks: flush any accumulated text, then emit as own chunk
         flushAccumulated();
+        overlapCarry = ''; // don't carry text context across a table/figure boundary
         if (block.text.trim()) {
           chunks.push({
             text: block.text.trim(),
@@ -316,7 +326,13 @@ export class LayoutChunkStrategy implements ChunkingStrategy {
         flushAccumulated();
       }
 
-      accText += (accText ? ' ' : '') + block.text;
+      // start fresh accumulation: prepend overlap from previous chunk if available
+      if (!accText && overlapCarry) {
+        accText = overlapCarry + ' ' + block.text;
+        overlapCarry = '';
+      } else {
+        accText += (accText ? ' ' : '') + block.text;
+      }
       accBlocks.push(block);
       accAvgFontSize =
         accBlocks.reduce(

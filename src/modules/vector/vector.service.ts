@@ -6,6 +6,7 @@ import { ChunkedDocument, StoredDocument } from '../../common/types/chunking.typ
 
 const INDEX_PATH = path.resolve('./data/vectors.faiss');
 const DOCS_PATH = path.resolve('./data/documents.json');
+const BM25_PATH = path.resolve('./data/bm25.json');
 const DIMS = 1024; // Qwen3-Embedding-0.6B output dimensions (via sentence-transformers)
 
 export interface ScoredResult {
@@ -46,10 +47,11 @@ export class VectorService implements OnModuleInit {
       this.logger.log('Created new FAISS IndexFlatIP (1024 dims).');
     }
 
-    this.buildBm25Index();
+    this.loadBm25Index();
   }
 
   store(chunks: ChunkedDocument[], embeddings: number[][]): void {
+    const startDocIdx = this.documents.length;
     this.index.add(embeddings.flat()); // faiss-node takes flat numeric array
     this.documents.push(
       ...chunks.map((c) => ({
@@ -61,8 +63,8 @@ export class VectorService implements OnModuleInit {
         metadata: c.metadata,
       })),
     );
+    this.addChunksToBm25Index(startDocIdx);
     this.persist();
-    this.buildBm25Index();
     this.logger.log(`Stored ${chunks.length} chunks. Total: ${this.documents.length}`);
   }
 
@@ -120,14 +122,36 @@ export class VectorService implements OnModuleInit {
     return text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
   }
 
-  private buildBm25Index(): void {
-    this.bm25TermFreqs.clear();
-    this.bm25DocFreq.clear();
-    this.bm25DocLengths = [];
+  private loadBm25Index(): void {
+    if (!fs.existsSync(BM25_PATH)) {
+      // No saved index yet — build from documents already loaded into memory
+      this.addChunksToBm25Index(0);
+      return;
+    }
+    const { termFreqs, docFreq, docLengths, avgDocLength } = JSON.parse(
+      fs.readFileSync(BM25_PATH, 'utf-8'),
+    );
+    this.bm25TermFreqs = new Map(
+      Object.entries(termFreqs).map(([term, docMap]) => [
+        term,
+        new Map(Object.entries(docMap as Record<string, number>).map(([k, v]) => [Number(k), v])),
+      ]),
+    );
+    this.bm25DocFreq = new Map(Object.entries(docFreq as Record<string, number>));
+    this.bm25DocLengths = docLengths;
+    this.bm25AvgDocLength = avgDocLength;
+    this.logger.log('Loaded BM25 index from disk.');
+  }
 
-    for (let docIdx = 0; docIdx < this.documents.length; docIdx++) {
+  private addChunksToBm25Index(fromDocIdx: number): void {
+    for (let docIdx = fromDocIdx; docIdx < this.documents.length; docIdx++) {
       const tokens = this.tokenize(this.documents[docIdx].text);
-      this.bm25DocLengths.push(tokens.length);
+
+      if (docIdx < this.bm25DocLengths.length) {
+        this.bm25DocLengths[docIdx] = tokens.length;
+      } else {
+        this.bm25DocLengths.push(tokens.length);
+      }
 
       const termFreq = new Map<string, number>();
       for (const token of tokens) {
@@ -150,6 +174,17 @@ export class VectorService implements OnModuleInit {
   private persist(): void {
     this.index.write(INDEX_PATH);
     fs.writeFileSync(DOCS_PATH, JSON.stringify(this.documents));
+    fs.writeFileSync(
+      BM25_PATH,
+      JSON.stringify({
+        termFreqs: Object.fromEntries(
+          [...this.bm25TermFreqs].map(([term, docMap]) => [term, Object.fromEntries(docMap)]),
+        ),
+        docFreq: Object.fromEntries(this.bm25DocFreq),
+        docLengths: this.bm25DocLengths,
+        avgDocLength: this.bm25AvgDocLength,
+      }),
+    );
   }
 
   getState() {

@@ -13,14 +13,15 @@ import pdf2image
 from paddleocr import PaddleOCR
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
+from reranker_factory import create_reranker
 
 app = FastAPI()
 
 INSTRUCTION = "Instruct: Given a question, retrieve relevant passages that answer it\nQuery: "
 
 model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", trust_remote_code=True)
-reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
+reranker, RERANKER_KEY = create_reranker()
 paddle_ocr = PaddleOCR(
     lang="en",
     use_textline_orientation=True,
@@ -228,5 +229,5 @@ def extract_tables(req: TableExtractRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "dims": model.get_sentence_embedding_dimension(), "reranker": "bge-reranker-v2-m3"}
+    return {"status": "ok", "dims": model.get_sentence_embedding_dimension(), "reranker": RERANKER_KEY}
 

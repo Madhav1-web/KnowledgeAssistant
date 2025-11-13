@@ -118,8 +118,24 @@ export class VectorService implements OnModuleInit {
     return results.slice(0, k);
   }
 
+  private static readonly STOPWORDS = new Set([
+    'a','an','the','and','or','but','if','in','on','at','to','for','of','with',
+    'by','from','is','it','its','be','was','are','were','been','has','have','had',
+    'do','does','did','will','would','could','should','may','might','shall','can',
+    'not','no','nor','so','yet','both','either','neither','as','than','that','this',
+    'these','those','i','you','he','she','we','they','me','him','her','us','them',
+    'my','your','his','our','their','what','which','who','whom','when','where','how',
+    'all','any','each','few','more','most','other','some','such','into','up','out',
+    'about','after','before','between','during','through','over','under','then','there',
+    'here','just','also','only','very','too','now','s','t','re','ve','ll','d','m',
+  ]);
+
   private tokenize(text: string): string[] {
-    return text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    return text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length > 1 && !VectorService.STOPWORDS.has(t));
   }
 
   private loadBm25Index(): void {
